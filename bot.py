@@ -1,17 +1,14 @@
-import discord
-from discord.ext import commands
-from os import listdir, scandir, makedirs
-from os.path import isfile, join, exists
-import shutil
 import json
+import os
+import shutil
+from os import listdir, makedirs, scandir
+from os.path import exists, isfile, join
 
-### SET OPTIONS ###
-TOKEN = "TOKEN" # set your token here
-PREFIX = "!"
+import aiohttp
+import discord
+from discord import SyncWebhook
+from discord.ext import commands
 
-CATEGORIE = 000000000 # set your categorie id here
-PICTURES_REP = "pictures"
-DONE_REP = "done"
 
 def verifyDir(dirpath:str):
     if not exists(dirpath):
@@ -26,7 +23,41 @@ def dumpToJson(filepath:str, data:dict):
     with open(filepath, "w", encoding="utf-8") as write_file:
         json.dump(data, write_file)
 
-bot = commands.Bot(command_prefix=PREFIX)
+def sort(filespath:list[str], option:str, reverse:bool):
+    if option == "size":
+        filespath = sorted(
+            filespath,
+            key = lambda x: os.stat(x).st_size
+        )
+
+    if reverse: filespath.reverse()
+    return filespath
+
+async def createWebhook(channel:discord.TextChannel, bot:commands.Bot):
+    return await channel.create_webhook(
+        name=bot.user.name,
+        avatar=bot.user.avatar,
+        reason="webhook to send pictures"
+    )
+
+async def getOrCreateWebhook(channel:discord.TextChannel, bot:commands.Bot):
+    webhooks = await channel.webhooks()
+    webhook = None
+    if len(webhooks) == 0:
+        webhook = await createWebhook(channel, bot)
+    else:
+        for webhook_ in webhooks:
+            if webhook_.user.id == bot.user.id:
+                webhook = webhook_
+                break
+    
+    if webhook is None: webhook = await createWebhook(channel, bot)
+    return webhook  
+
+
+config = getFromJson("./config.json")
+
+bot = commands.Bot(command_prefix=config["PREFIX"])
 
 
 @bot.event
@@ -37,57 +68,57 @@ async def on_ready():
 
 
 @bot.command(name="post")
-async def post(ctx):
-    errors = []
-    pictures_count = 0
-
-    # get the categorie
-    categorie = discord.utils.get(ctx.guild.categories, id=CATEGORIE)
+async def post(ctx, categorie:discord.CategoryChannel):
+    settings = getFromJson("./settings.json")
+    PICTURES_DIR = settings["pictures-dir"]
 
     # get all subdirs
-    verifyDir(PICTURES_REP)
-    subdirs = [f for f in scandir(PICTURES_REP) if f.is_dir()]
+    verifyDir(PICTURES_DIR)
+    subdirs = [f for f in scandir(PICTURES_DIR) if f.is_dir()]
+
+    errors = []
+    max_pictures = 0
+    for subdir in subdirs: max_pictures += len([f for f in scandir(subdir) if f.is_file()])
+    pictures_count = 0
 
     # create channel 
     for subdir in subdirs:
-
-        data = getFromJson("data.json")
-        channels = [channel for channel in categorie.text_channels]
-
-        subdir_channel = None
-
-        exists = False
-        if subdir.name in data:
-            for channel in channels:
-                if channel.id == data[subdir.name]:
-                    subdir_channel = channel
-                    exists = True
-                    break
-
-        if not exists:
+        subdir_channel = discord.utils.get(categorie.text_channels, name=subdir.name)
+        if subdir_channel is None:
             subdir_channel = await categorie.create_text_channel(subdir.name)
-            data[subdir.name] = subdir_channel.id
-            dumpToJson("data.json", data)
         
+        # get or create webhook
+        webhook = await getOrCreateWebhook(subdir_channel, bot)
 
         # get all subdir's pictures
         pictures = [join(subdir.path, f) for f in listdir(subdir.path) if isfile(join(subdir.path, f))]
+        if settings["sort"]: pictures = sort(pictures, settings["sort-by"], settings["sort-reverse"])
         
         # post pictures
         for picture in pictures:
             pictures_count+=1
             try:
-                await subdir_channel.send(file=discord.File(picture))
-                verifyDir(DONE_REP)
-                dst = join(DONE_REP, subdir.name)
-                verifyDir(dst)
-                shutil.move(picture, dst)
-            except:
-                errors.append(picture)
+                await webhook.send(file=discord.File(picture))
+
+                # move picture if move setting is true
+                if settings["move"]:
+                    MOVE_DIR = settings["move-dir"]
+                    verifyDir(MOVE_DIR)
+                    dst = join(MOVE_DIR, subdir.name)
+                    verifyDir(dst)
+                    shutil.move(picture, dst)
+                
+                #  delete picture if delete setting is true and picture setting is false
+                elif settings["delete"]:
+                    os.remove(picture)
+
+            except Exception as e:
+                errors.append((picture, e))
     
     # send result
     await ctx.send(f"{pictures_count-len(errors)}/{pictures_count} images posted")
     for error in errors: print(error)
 
+
 if __name__ == '__main__':
-    bot.run(TOKEN)
+    bot.run(config["TOKEN"])
